@@ -4,7 +4,7 @@ import urllib
 import sys
 import datetime
 
-from staff import email
+from nadine import email
 from django.contrib.auth.models import User
 from django.core.management.base import BaseCommand, CommandError
 
@@ -17,7 +17,7 @@ class Command(BaseCommand):
     def print_keys(self):
         print("Valid Message Keys: ")
         for key in email.valid_message_keys():
-            print "   " + key
+            print("   " + key)
 
     def handle(self, *labels, **options):
         if not labels or len(labels) != 2:

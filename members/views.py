@@ -1,49 +1,58 @@
-import traceback
+import json
 import string
+import traceback
+import time
 from datetime import date, datetime, timedelta
 from operator import itemgetter, attrgetter
 from calendar import Calendar, HTMLCalendar
+from collections import defaultdict
 
 from django.conf import settings
 from django.template import RequestContext, Template, Context
 from django.contrib.auth.models import User
 from django.core.urlresolvers import reverse
+from django.core import serializers
+from django.core.serializers.json import DjangoJSONEncoder
+
 from django.contrib.auth.decorators import login_required, user_passes_test
-from django.http import HttpResponse, HttpResponseRedirect, HttpResponseForbidden, Http404
+from django.http import HttpResponse, HttpResponseRedirect, HttpResponseForbidden, Http404, HttpRequest
+from django.http import JsonResponse
 from django.shortcuts import render_to_response, get_object_or_404
 from django.contrib.admin.views.decorators import staff_member_required
 from django.views.decorators.csrf import csrf_exempt
 from django.utils import timezone
 from django.template.defaultfilters import slugify
 from django.contrib.sites.models import Site
+from django.contrib import messages
+from django.contrib.auth.tokens import default_token_generator
 
-#from gather.models import Event, Location, EventAdminGroup
-#from gather.forms import EventForm
-#from gather.views import get_location
+
 from interlink.forms import MailingListSubscriptionForm
 from interlink.models import IncomingMail
 from members.forms import EditProfileForm
 from members.models import HelpText, UserNotification
 from arpwatch import arp
 from arpwatch.models import ArpLog, UserDevice
-from nadine.models.core import Member, Membership, DailyLog
+from nadine.models.core import UserProfile, Membership
+from nadine.models.usage import CoworkingDay
+from nadine.models.resource import Room
 from nadine.models.payment import Transaction
 from nadine.models.alerts import MemberAlert
-from staff import usaepay, email
+from nadine import email
 from staff.forms import *
-from nadine import mailgun
 
+from nadine import mailgun
+from nadine.utils.slack_api import SlackAPI
+from nadine.utils.payment_api import PaymentAPI
 
 def is_active_member(user):
     if user and not user.is_anonymous():
-        profile = user.get_profile()
-        if profile:
-            # If today is their Free Trial Day count them as active
-            if DailyLog.objects.filter(member=profile, payment='Trial', visit_date=date.today()).count() == 1:
-                return True
+        # If today is their Free Trial Day count them as active
+        if CoworkingDay.objects.filter(user=user, payment='Trial', visit_date=date.today()).count() == 1:
+            return True
 
-            # Check to make sure their currently an active member
-            return profile.is_active()
+        # Check to make sure their currently an active member
+        return user.profile.is_active()
 
     # No user, no profile, no active
     return False
@@ -51,9 +60,7 @@ def is_active_member(user):
 
 def is_manager(user):
     if user and not user.is_anonymous():
-        profile = user.get_profile()
-        if profile:
-            return profile.is_manager()
+        return user.profile.is_manager()
     return False
 
 
@@ -72,8 +79,24 @@ def home(request):
     current_context = RequestContext(request)
     template = Template(template_text)
     rendered = template.render(current_context)
-    return render_to_response('members/home.html', {'title': title, 'page_body': rendered, 'other_topics': other_topics}, current_context)
+    return render_to_response('members/home.html', {'title': title, 'page_body': rendered, 'other_topics': other_topics, 'settings': settings}, current_context)
 
+@login_required
+def faq(request):
+    title = "faq"
+    template_text = "Frequently Asked Questions"
+    other_topics = {}
+    for topic in HelpText.objects.all():
+        if topic.slug == 'faq':
+            title = topic.title
+            template_text = topic.template
+        else:
+            other_topics[topic.title] = topic
+
+    current_context = RequestContext(request)
+    template = Template(template_text)
+    rendered = template.render(current_context)
+    return render_to_response('members/faq.html', {'title': title, 'page_body': rendered, 'other_topics': other_topics, 'settings': settings}, current_context)
 
 @login_required
 def help_topic(request, slug):
@@ -84,18 +107,18 @@ def help_topic(request, slug):
     current_context = context_instance = RequestContext(request)
     template = Template(template_text)
     rendered = template.render(current_context)
-    return render_to_response('members/help_topic.html', {'title': title, 'page_body': rendered, 'other_topics': other_topics}, current_context)
+    return render_to_response('members/help_topic.html', {'title': title, 'page_body': rendered, 'other_topics': other_topics, 'settings': settings}, current_context)
 
 
 @login_required
-@user_passes_test(is_active_member, login_url='members.views.not_active')
+@user_passes_test(is_active_member, login_url='member_not_active')
 def view_members(request):
-    active_members = Member.objects.active_members().order_by('user__first_name')
-    here_today = arp.users_for_day()
+    active_members = User.helper.active_members().order_by('first_name')
+    here_today = User.helper.here_today()
     has_key = has_mail = None
-    if request.user.get_profile().is_manager():
-        has_key = Member.objects.members_with_keys()
-        has_mail = Member.objects.members_with_mail()
+    if request.user.profile.is_manager():
+        has_key = User.helper.members_with_keys()
+        has_mail = User.helper.members_with_mail()
 
     search_terms = None
     search_results = None
@@ -103,11 +126,11 @@ def view_members(request):
         search_form = MemberSearchForm(request.POST)
         if search_form.is_valid():
             search_terms = search_form.cleaned_data['terms']
-            search_results = Member.objects.search(search_terms, True)
+            search_results = User.helper.search(search_terms, True)
     else:
         search_form = MemberSearchForm()
 
-    return render_to_response('members/view_members.html', {'active_members': active_members, 'here_today': here_today,
+    return render_to_response('members/view_members.html', {'settings': settings, 'active_members': active_members, 'here_today': here_today,
                                                             'search_results': search_results, 'search_form': search_form, 'search_terms': search_terms, 'has_key': has_key, 'has_mail': has_mail},
                               context_instance=RequestContext(request))
 
@@ -119,112 +142,193 @@ def chat(request):
 
 
 def not_active(request):
-    return render_to_response('members/not_active.html', {}, context_instance=RequestContext(request))
+    return render_to_response('members/not_active.html', {'settings': settings}, context_instance=RequestContext(request))
 
 
 @login_required
 def profile_redirect(request):
-    return HttpResponseRedirect(reverse('members.views.user', kwargs={'username': request.user.username}))
+    return HttpResponseRedirect(reverse('member_profile', kwargs={'username': request.user.username}))
 
 
 @login_required
 def user(request, username):
     user = get_object_or_404(User, username=username)
-    member = get_object_or_404(Member, user=user)
-    activity = DailyLog.objects.filter(member=member, payment='Bill', bills__isnull=True, visit_date__gt=timezone.now().date() - timedelta(days=31))
-    guest_activity = DailyLog.objects.filter(guest_of=member, payment='Bill', guest_bills__isnull=True, visit_date__gte=timezone.now().date() - timedelta(days=31))
     emergency_contact = user.get_emergency_contact()
-    return render_to_response('members/user.html', {'user': user, 'member': member, 'emergency_contact': emergency_contact, 'activity': activity, 
-                              'guest_activity': guest_activity, 'settings': settings}, context_instance=RequestContext(request))
+    return render_to_response('members/profile.html', {'user': user, 'emergency_contact': emergency_contact, 'settings': settings}, context_instance=RequestContext(request))
+
+
+@csrf_exempt
+@login_required
+def profile_membership(request, username):
+    user = get_object_or_404(User, username=username)
+    memberships = user.membership_set.all().reverse()
+    return render_to_response('members/profile_membership.html', {'user': user, 'memberships': memberships}, context_instance=RequestContext(request))
+
+
+@csrf_exempt
+@login_required
+def user_activity_json(request, username):
+    user = get_object_or_404(User.objects.select_related('profile'), username=username)
+    response_data = {}
+    active_membership = user.profile.active_membership()
+    if active_membership:
+        response_data['is_active'] = True
+        response_data['allowance'] = active_membership.get_allowance()
+    activity_this_month = user.profile.activity_this_month()
+    #response_data['activity_this_month'] = serializers.serialize('json', activity_this_month)
+    response_data['usage_this_month'] = len(activity_this_month)
+    #response_data['coworkingdays'] = serializers.serialize('json', user.coworkingday_set.all())
+    print response_data
+    return JsonResponse(response_data)
+
+
+@csrf_exempt
+@login_required
+def profile_activity(request, username):
+    user = get_object_or_404(User.objects.select_related('profile'), username=username)
+    is_active = False
+    allowance = 0
+    active_membership = user.profile.active_membership()
+    if active_membership:
+        is_active = True
+        allowance = active_membership.get_allowance()
+    activity = user.profile.activity_this_month()
+    return render_to_response('members/profile_activity.html', {'user': user, 'is_active': is_active, 'activity':activity, 'allowance':allowance}, context_instance=RequestContext(request))
+
+
+@csrf_exempt
+@login_required
+def profile_billing(request, username):
+    user = get_object_or_404(User.objects.prefetch_related('transaction_set', 'bill_set'), username=username)
+    six_months_ago = timezone.now() - relativedelta(months=6)
+    active_membership = user.profile.active_membership()
+    bills = user.bill_set.filter(bill_date__gte=six_months_ago)
+    payments = user.transaction_set.prefetch_related('bills').filter(transaction_date__gte=six_months_ago)
+    return render_to_response('members/profile_billing.html', {'user':user, 'active_membership':active_membership,
+        'bills':bills, 'payments':payments, 'settings':settings}, context_instance=RequestContext(request))
 
 
 @login_required
-@user_passes_test(is_active_member, login_url='members.views.not_active')
+@user_passes_test(is_active_member, login_url='member_not_active')
 def mail(request):
     user = request.user
     if request.method == 'POST':
         sub_form = MailingListSubscriptionForm(request.POST)
         if sub_form.is_valid():
             sub_form.save(user)
-            return HttpResponseRedirect(reverse('members.views.mail'))
-    return render_to_response('members/mail.html', {'user': user, 'mailing_list_subscription_form': MailingListSubscriptionForm()}, context_instance=RequestContext(request))
+            return HttpResponseRedirect(reverse('member_email_lists'))
+    return render_to_response('members/mail.html', {'user': user, 'mailing_list_subscription_form': MailingListSubscriptionForm(), 'settings': settings}, context_instance=RequestContext(request))
 
 
 @login_required
-@user_passes_test(is_active_member, login_url='members.views.not_active')
+@user_passes_test(is_active_member, login_url='member_not_active')
 def mail_message(request, id):
     message = get_object_or_404(IncomingMail, id=id)
-    return render_to_response('members/mail_message.html', {'message': message}, context_instance=RequestContext(request))
+    return render_to_response('members/mail_message.html', {'message': message, 'settings': settings}, context_instance=RequestContext(request))
 
 
 @login_required
 def edit_profile(request, username):
     user = get_object_or_404(User, username=username)
+    if not user == request.user:
+        if not request.user.is_staff:
+            return HttpResponseRedirect(reverse('member_profile', kwargs={'username': request.user.username}))
 
     if request.method == 'POST':
         profile_form = EditProfileForm(request.POST, request.FILES)
         if profile_form.is_valid():
             profile_form.save()
-            return HttpResponseRedirect(reverse('members.views.user', kwargs={'username': user.username}))
+            return HttpResponseRedirect(reverse('member_profile', kwargs={'username': user.username}))
     else:
-        profile = user.get_profile()
+        profile = user.profile
         emergency_contact = user.get_emergency_contact()
-        profile_form = EditProfileForm(initial={'member_id': profile.id, 'first_name': user.first_name, 'last_name': user.last_name, 'email': user.email,
-                                                'phone': profile.phone, 'phone2': profile.phone2, 'email2': profile.email2,
+        profile_form = EditProfileForm(initial={'username': user.username, 'first_name': user.first_name, 'last_name': user.last_name, 'email': user.email,
+                                                'phone': profile.phone, 'phone2': profile.phone2,
                                                 'address1': profile.address1, 'address2': profile.address2, 'city': profile.city, 'state': profile.state, 'zipcode': profile.zipcode,
-                                                'company_name': profile.company_name, 'url_personal': profile.url_personal, 'url_professional': profile.url_professional,
-                                                'url_facebook': profile.url_facebook, 'url_twitter': profile.url_twitter,
-                                                'url_linkedin': profile.url_linkedin, 'url_aboutme': profile.url_aboutme, 'url_github': profile.url_github,
+                                                'company_name': profile.company_name, 'url_personal': profile.url_personal(), 'url_professional': profile.url_professional(),
+                                                'url_facebook': profile.url_facebook(), 'url_twitter': profile.url_twitter(),
+                                                'url_linkedin': profile.url_linkedin(), 'url_github': profile.url_github(),
+                                                'bio': profile.bio, 'photo': profile.photo,
+                                                'public_profile': profile.public_profile,
                                                 'gender': profile.gender, 'howHeard': profile.howHeard, 'industry': profile.industry, 'neighborhood': profile.neighborhood,
                                                 'has_kids': profile.has_kids, 'self_employed': profile.self_employed,
-                                                'emergency_name': emergency_contact.name, 'emergency_relationship': emergency_contact.relationship, 
-                                                'emergency_phone': emergency_contact.phone, 'emergency_email': emergency_contact.email, 
+                                                'emergency_name': emergency_contact.name, 'emergency_relationship': emergency_contact.relationship,
+                                                'emergency_phone': emergency_contact.phone, 'emergency_email': emergency_contact.email,
+
                                             })
 
-    return render_to_response('members/edit_profile.html', {'user': user, 'profile_form': profile_form}, context_instance=RequestContext(request))
+    return render_to_response('members/edit_profile.html', {'user': user, 'profile_form': profile_form, 'ALLOW_PHOTO_UPLOAD': settings.ALLOW_PHOTO_UPLOAD, 'settings': settings}, context_instance=RequestContext(request))
 
+
+@login_required
+def slack(request, username):
+    user = get_object_or_404(User, username=username)
+    if not user == request.user:
+        if not request.user.is_staff:
+            return HttpResponseRedirect(reverse('member_profile', kwargs={'username': request.user.username}))
+
+    if request.method == 'POST':
+        try:
+            slack_api = SlackAPI()
+            slack_api.invite_user(user)
+            messages.add_message(request, messages.INFO, "Slack Invitation Sent.  Check your email for further instructions.")
+        except Exception as e:
+            messages.add_message(request, messages.ERROR, "Failed to send invitation: %s" % e)
+
+    return render_to_response('members/slack.html', {'user': user, 'team_url':settings.SLACK_TEAM_URL, 'settings': settings}, context_instance=RequestContext(request))
+
+@csrf_exempt
+def slack_bots(request):
+    # Stupid chat bot
+    try:
+        text = request.POST.get("text")[7:]
+        SlackAPI().post_message(text)
+    except Exception as e:
+        return JsonResponse({'text': str(e)})
+    return JsonResponse({})
 
 @login_required
 def receipt(request, username, id):
     user = get_object_or_404(User, username=username)
     if not user == request.user:
         if not request.user.is_staff:
-            return HttpResponseRedirect(reverse('members.views.user', kwargs={'username': request.user.username}))
+            return HttpResponseRedirect(reverse('member_profile', kwargs={'username': request.user.username}))
+
     transaction = get_object_or_404(Transaction, id=id)
-    if not user.profile == transaction.member:
+    if not user == transaction.user:
         if not request.user.is_staff:
-            return HttpResponseRedirect(reverse('members.views.user', kwargs={'username': request.user.username}))
+            return HttpResponseRedirect(reverse('member_profile', kwargs={'username': request.user.username}))
     bills = transaction.bills.all()
-    return render_to_response('members/receipt.html', {'user': user, 'transaction': transaction, 'bills': bills}, context_instance=RequestContext(request))
+    return render_to_response('members/receipt.html', {'user': user, 'transaction': transaction, 'bills': bills, 'settings': settings}, context_instance=RequestContext(request))
 
 
 @login_required
-@user_passes_test(is_active_member, login_url='members.views.not_active')
+@user_passes_test(is_active_member, login_url='member_not_active')
 def tags(request):
     tags = []
-    for tag in Member.tags.all().order_by('name'):
-        members = Member.objects.active_members().filter(tags__name__in=[tag])
-        if members:
+    for tag in UserProfile.tags.all().order_by('name'):
+        members = User.helper.members_with_tag(tag)
+        if members.count() > 0:
             tags.append((tag, members))
-    return render_to_response('members/tags.html', {'tags': tags}, context_instance=RequestContext(request))
+    return render_to_response('members/tags.html', {'tags': tags, 'settings': settings}, context_instance=RequestContext(request))
 
 
 @login_required
-@user_passes_test(is_active_member, login_url='members.views.not_active')
+@user_passes_test(is_active_member, login_url='member_not_active')
 def tag_cloud(request):
     tags = []
-    for tag in Member.tags.all().order_by('name'):
-        members = Member.objects.active_members().filter(tags__name__in=[tag])
-        if members:
-            tags.append((tag, members))
-    return render_to_response('members/tag_cloud.html', {'tags': tags}, context_instance=RequestContext(request))
+    for tag in UserProfile.tags.all().order_by('name'):
+        member_count = User.helper.members_with_tag(tag).count()
+        if member_count:
+            tags.append((tag, member_count))
+    return render_to_response('members/tag_cloud.html', {'tags': tags, 'settings': settings}, context_instance=RequestContext(request))
 
 
 @login_required
-@user_passes_test(is_active_member, login_url='members.views.not_active')
+@user_passes_test(is_active_member, login_url='member_not_active')
 def tag(request, tag):
-    members = Member.objects.active_members().filter(tags__name__in=[tag])
-    return render_to_response('members/tag.html', {'tag': tag, 'members': members}, context_instance=RequestContext(request))
+    members = User.helper.members_with_tag(tag)
+    return render_to_response('members/tag.html', {'tag': tag, 'members': members, 'settings': settings}, context_instance=RequestContext(request))
 
 
 @login_required
@@ -232,9 +336,8 @@ def user_tags(request, username):
     user = get_object_or_404(User, username=username)
     if not user == request.user:
         if not request.user.is_staff:
-            return HttpResponseRedirect(reverse('members.views.user', kwargs={'username': request.user.username}))
-    profile = user.get_profile()
-    user_tags = profile.tags.all()
+            return HttpResponseRedirect(reverse('member_profile', kwargs={'username': request.user.username}))
+    user_tags = user.profile.tags.all()
 
     error = None
     if request.method == 'POST':
@@ -245,10 +348,10 @@ def user_tags(request, username):
                     error = "Tags can't contain punctuation."
                     break
             else:
-                profile.tags.add(tag.lower())
+                user.profile.tags.add(tag.lower())
 
-    all_tags = Member.tags.all()
-    return render_to_response('members/user_tags.html', {'user': user, 'user_tags': user_tags, 'all_tags': all_tags, 'error': error}, context_instance=RequestContext(request))
+    all_tags = UserProfile.tags.all()
+    return render_to_response('members/user_tags.html', {'user': user, 'user_tags': user_tags, 'all_tags': all_tags, 'error': error, 'settings': settings}, context_instance=RequestContext(request))
 
 
 @login_required
@@ -256,15 +359,17 @@ def delete_tag(request, username, tag):
     user = get_object_or_404(User, username=username)
     if not user == request.user:
         if not request.user.is_staff:
-            return HttpResponseRedirect(reverse('members.views.user', kwargs={'username': request.user.username}))
-    user.get_profile().tags.remove(tag)
-    return HttpResponseRedirect(reverse('members.views.user_tags', kwargs={'username': request.user.username}))
+            return HttpResponseRedirect(reverse('member_profile', kwargs={'username': request.user.username}))
+    user.profile.tags.remove(tag)
+    return HttpResponseRedirect(reverse('member_user_tags', kwargs={'username': username, 'settings': settings}))
 
 
 @login_required
-def user_devices(request):
-    user = request.user
-    profile = user.get_profile()
+def user_devices(request, username):
+    user = get_object_or_404(User, username=username)
+    if not user == request.user:
+        if not request.user.is_staff:
+            return HttpResponseRedirect(reverse('member_profile', kwargs={'username': request.user.username}))
 
     error = None
     if request.method == 'POST':
@@ -283,11 +388,11 @@ def user_devices(request):
     devices = arp.devices_by_user(user)
     ip = request.META['REMOTE_ADDR']
     this_device = arp.device_by_ip(ip)
-    return render_to_response('members/user_devices.html', {'user': user, 'devices': devices, 'this_device': this_device, 'ip': ip, 'error': error}, context_instance=RequestContext(request))
+    return render_to_response('members/user_devices.html', {'user': user, 'devices': devices, 'this_device': this_device, 'ip': ip, 'error': error, 'settings': settings}, context_instance=RequestContext(request))
 
 
 @login_required
-@user_passes_test(is_active_member, login_url='members.views.not_active')
+@user_passes_test(is_active_member, login_url='member_not_active')
 def connect(request, username):
     message = ""
     target = get_object_or_404(User, username=username)
@@ -296,7 +401,7 @@ def connect(request, username):
     if action and action == "send_info":
         email.send_contact_request(user, target)
         message = "Email Sent"
-    return render_to_response('members/connect.html', {'target': target, 'user': user, 'page_message': message}, context_instance=RequestContext(request))
+    return render_to_response('members/connect.html', {'target': target, 'user': user, 'page_message': message, 'settings': settings}, context_instance=RequestContext(request))
 
 
 @login_required
@@ -310,7 +415,7 @@ def add_notification(request, username):
     target = get_object_or_404(User, username=username)
     if UserNotification.objects.filter(notify_user=request.user, target_user=target, sent_date__isnull=True).count() == 0:
         UserNotification.objects.create(notify_user=request.user, target_user=target)
-    return HttpResponseRedirect(reverse('members.views.notifications', kwargs={}))
+    return HttpResponseRedirect(reverse('member_notifications', kwargs={}))
 
 
 @login_required
@@ -318,131 +423,27 @@ def delete_notification(request, username):
     target = get_object_or_404(User, username=username)
     for n in UserNotification.objects.filter(notify_user=request.user, target_user=target):
         n.delete()
-    return HttpResponseRedirect(reverse('members.views.notifications', kwargs={}))
-
-# On ice for now.  Preffer a JSON alernative
-# def ticker(request):
-#	here_today = arp.users_for_day()
-#
-#	now = timezone.localtime(timezone.now())
-#	midnight = now - timedelta(seconds=now.hour*60*60 + now.minute*60 + now.second)
-#	device_logs = ArpLog.objects.for_range(midnight, now)
-#
-#	counts = {}
-#	counts['members'] = Member.objects.active_members().count()
-#	counts['full_time'] = Membership.objects.active_memberships(now).filter(has_desk=True).count()
-#	counts['part_time'] = counts['members'] - counts['full_time']
-#	counts['here_today'] = len(here_today)
-#	counts['devices'] = len(device_logs)
-#
-#	# Auto refresh?
-#	refresh = True;
-#	if request.GET.has_key("norefresh"):
-#		refresh = False;
-#
-#	return render_to_response('members/ticker.html',{'counts':counts, 'members':here_today, 'refresh':refresh}, context_instance=RequestContext(request))
+    return HttpResponseRedirect(reverse('member_notifications', kwargs={}))
 
 
 @login_required
 def disable_billing(request, username):
     user = get_object_or_404(User, username=username)
-    email.announce_billing_disable(user)
     if user == request.user or request.user.is_staff:
-        usaepay.disableAutoBilling(username)
-    return HttpResponseRedirect(reverse('members.views.user', kwargs={'username': request.user.username}))
-
-
-@csrf_exempt
-@login_required
-def new_billing(request):
-    error = None
-    username = None
-    if request.method != 'POST' or 'username' not in request.POST or 'auth' not in request.POST:
-        error = "Invalid form fields!"
-    else:
-        username = request.POST.get('username')
-        if not usaepay.authorize(username, request.POST.get('auth')):
-            error = "Invalid authorization code!"
-        else:
-            member = Member.objects.get(user__username=username)
-            if not member:
-                error = "Could not find '%s'" % (username)
-            else:
-                member.valid_billing = True
-                member.save()
-                if not usaepay.disableAutoBilling(username):
-                    error = "Could not disable auto-billing"
-    return render_to_response('members/new_billing.html', {'username': username, 'error': error}, context_instance=RequestContext(request))
-
-#@login_required
-#@user_passes_test(is_active_member, login_url='members.views.not_active')
-# def events_today(request):
-#	today = timezone.localtime(timezone.now())
-#	return HttpResponseRedirect(reverse('members.views.events', kwargs={'year':today.year, 'month':today.month}))
-
-#@login_required
-#@user_passes_test(is_active_member, login_url='members.views.not_active')
-# def events(request, year, month):
-#	thisdate = None
-#	try:
-#		thisdate = date(int(year), int(month), 1)
-#	except:
-#		return HttpResponseRedirect(reverse('members.views.events_today', kwargs={}))
-#	previous = thisdate - timedelta(days=1)
-#	next = thisdate + timedelta(days=32)
-#	next = date(next.year, next.month, 1)
-#	calendar_events=[]
-#	for day in Calendar(0).itermonthdates(thisdate.year, thisdate.month):
-#		if day.month == thisdate.month:
-#			start = datetime.datetime(year=day.year, month=day.month, day=day.day, hour=0, minute=0, second=0, microsecond=0)
-#			start = timezone.make_aware(start, timezone.get_current_timezone())
-#			end = start + timedelta(days=1)
-#			events = Event.objects.filter(start__gte=start, start__lt=end)
-#			calendar_events.append({'day':day, 'events':events})
-#	return render_to_response('members/events.html',{'calendar_events':calendar_events, 'year':year, 'month':month, 'this_month_str': thisdate.strftime("%B %Y"),
-#		'previous':previous, 'next':next, }, context_instance=RequestContext(request))
-
-#@login_required
-#@user_passes_test(is_active_member, login_url='members.views.not_active')
-# def view_event(request, event_id):
-#	event = get_object_or_404(Event, id=event_id)
-#	return render_to_response('members/event_view.html',{'event':event}, context_instance=RequestContext(request))
-
-#@login_required
-#@user_passes_test(is_active_member, login_url='members.views.not_active')
-# def add_event(request):
-#	current_user = request.user
-#	location = get_location()
-#	location_admin_group = EventAdminGroup.objects.get(location=location)
-#	if request.method == 'POST':
-#		print request.POST
-#		form = EventForm(request.POST, request.FILES)
-#		form.data['slug'] = slugify(form.data['title'])
-#		form.data['limit'] = 0
-#		if form.is_valid():
-#			event = form.save(commit=False)
-#			event.creator = current_user
-#			event.location = location
-#			event.admin = location_admin_group
-#			#event.organizers.add(current_user)
-#			event.save()
-#			return HttpResponseRedirect(reverse('members.views.events', kwargs={'year':event.start.year, 'month':event.start.month}))
-#		else:
-#			print "form error"
-#			print form.errors
-#	else:
-#		form = EventForm(initial={'start':timezone.localtime(timezone.now())})
-#	return render_to_response('members/event_add.html',{'form':form}, context_instance=RequestContext(request))
+        api = PaymentAPI()
+        api.disable_recurring(username)
+        email.announce_billing_disable(user)
+    return HttpResponseRedirect(reverse('member_profile', kwargs={'username': user.username}))
 
 
 @login_required
-@user_passes_test(is_active_member, login_url='members.views.not_active')
+@user_passes_test(is_active_member, login_url='member_not_active')
 def events_google(request, location_slug=None):
-    return render_to_response('members/events_google.html', {}, context_instance=RequestContext(request))
+    return render_to_response('members/events_google.html', {'settings': settings}, context_instance=RequestContext(request))
 
 
 @login_required
-@user_passes_test(is_active_member, login_url='members.views.not_active')
+@user_passes_test(is_active_member, login_url='member_not_active')
 def file_view(request, disposition, username, file_name):
     if not request.user.is_staff and not username == request.user.username:
         return HttpResponseForbidden("Forbidden")
@@ -458,13 +459,13 @@ def file_view(request, disposition, username, file_name):
 
 @csrf_exempt
 @login_required
-@user_passes_test(is_manager, login_url='members.views.not_active')
+@user_passes_test(is_manager, login_url='member_not_active')
 def manage_member(request, username):
     user = get_object_or_404(User, username=username)
 
     # Handle the buttons if a task is being marked done
     if request.method == 'POST':
-        print request.POST
+        #print(request.POST)
         if 'resolve_task' in request.POST:
             alert = MemberAlert.objects.get(pk=request.POST.get('alert_id'))
             alert.resolve(request.user)
@@ -474,9 +475,154 @@ def manage_member(request, username):
 
     return render_to_response('members/manage_member.html', {'user': user, 'page_content': html_content}, context_instance=RequestContext(request))
 
-#@login_required
-#@user_passes_test(is_active_member, login_url='members.views.not_active')
-# def my_create_event(request, location_slug=None):
-#	return create_event(request, location_slug)
+def register(request):
+    page_message = None
+    if request.method == 'POST':
+        registration_form = NewUserForm(request.POST)
+        try:
+            if registration_form.is_valid():
+                user = registration_form.save()
+                token = default_token_generator.make_token(user)
+                path = 'Ng-' + token + '/'
+                return HttpResponseRedirect(reverse('password_reset')+ path)
+        except Exception as e:
+            page_message = str(e)
+            logger.error(str(e))
+    else:
+        registration_form = NewUserForm()
+    return render_to_response('members/register.html', { 'registration_form': registration_form, 'page_message': page_message, 'settings': settings}, context_instance=RequestContext(request))
 
-# Copyright 2014 Office Nomads LLC (http://www.officenomads.com/) Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License. You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0 Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License.
+def coerce_times(start, end, date):
+    start_dt = datetime.datetime.strptime(date + " " + start, "%Y-%m-%d %H:%M")
+    start_ts = timezone.make_aware(start_dt, timezone.get_current_timezone())
+    end_dt = datetime.datetime.strptime(date + " " + end, "%Y-%m-%d %H:%M")
+    end_ts = timezone.make_aware(end_dt, timezone.get_current_timezone())
+
+    return start_ts, end_ts
+
+@login_required
+@user_passes_test(is_active_member, login_url='member_not_active')
+def create_booking(request):
+    calendar = Room().get_raw_calendar()
+    labels = []
+
+    for block in calendar:
+        label = block['hour'] + ":" + block['minutes']
+        labels.append(label)
+
+    # Process URL variables
+    has_av = request.GET.get('has_av', None)
+    has_phone = request.GET.get('has_phone', None)
+    floor = request.GET.get('floor', None)
+    seats = request.GET.get('seats', None)
+    date = request.GET.get('date', str(timezone.now().date()))
+    start = request.GET.get('start', str(datetime.datetime.now().hour) + ':' + str(datetime.datetime.now().minute))
+    end = request.GET.get('end', str(datetime.datetime.now().hour + 2) + ':' + str(datetime.datetime.now().minute))
+
+    # Turn our date, start, and end strings into timestamps
+    start_ts, end_ts = coerce_times(start, end, date)
+
+    #Make auto date for start and end if not otherwise given
+    room_dict = {}
+    rooms = Room.objects.available(start=start_ts, end=end_ts, has_av=has_av, has_phone=has_phone, floor=floor, seats=seats)
+
+    #Make a target date to get all events for that date
+    target_date = start_ts.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_date = target_date + timedelta(days=1)
+
+    # Get all the events for each room in that day
+    for room in rooms:
+        room_dict[room] = room.get_calendar(start, end, target_date, end_date)
+
+    if request.method == 'POST':
+        room = request.POST.get('room')
+        start = request.POST.get('start')
+        end = request.POST.get('end')
+        date = request.POST.get('date')
+
+        return HttpResponseRedirect(reverse('member_confirm_booking', kwargs={'room': room, 'start': start, 'end': end, 'date': date}))
+
+    return render_to_response('members/user_create_booking.html', {'rooms': rooms, 'labels':labels, 'start':start, 'end':end, 'date': date, 'has_av':has_av, 'floor': floor, 'has_phone': has_phone, 'room_dict': room_dict}, context_instance=RequestContext(request))
+
+@login_required
+@user_passes_test(is_active_member, login_url='member_not_active')
+def confirm_booking(request, room, start, end, date):
+    user = request.user
+    room = get_object_or_404(Room, name=room)
+    page_message = None
+    booking_form = EventForm()
+    calendar = Room().get_raw_calendar()
+    labels = []
+
+    for block in calendar:
+        label = block['hour'] + ":" + block['minutes']
+        labels.append(label)
+
+    start_ts, end_ts = coerce_times(start, end, date)
+
+    target_date = start_ts.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_date = target_date + timedelta(days=1)
+
+    event_dict = {}
+    event_dict[room] = room.get_calendar(start, end, target_date, end_date)
+
+    if request.method == 'POST':
+        user = request.user
+        room = request.POST.get('room')
+        room = get_object_or_404(Room, name=room)
+        start = request.POST.get('start')
+        end = request.POST.get('end')
+        date = request.POST.get('date')
+        start_ts, end_ts = coerce_times(start, end, date)
+        description = request.POST.get('description', '')
+        charge = request.POST.get('charge', 0)
+        is_public = request.POST.get('is_public', False)
+        event = Event(user=user, room=room, start_ts=start_ts, end_ts=end_ts, description=description, charge=charge, is_public=is_public)
+
+        stillAv = Room.objects.available(start=start_ts, end=end_ts)
+
+        if room in stillAv:
+            try:
+                event.save()
+
+                return HttpResponseRedirect(reverse('member_profile', kwargs={'username': user.username}))
+
+            except Exception as e:
+                page_message = str(e)
+                logger.error(str(e))
+        else:
+            page_message = 'This room is no longer available at the requested time.'
+    else:
+        booking_form = EventForm()
+
+    return render_to_response('members/user_confirm_booking.html', {'booking_form':booking_form, 'start':start, 'end':end, 'room': room, 'date': date, 'labels': labels, 'page_message': page_message, 'event_dict': event_dict}, context_instance=RequestContext(request))
+
+@login_required
+@user_passes_test(is_active_member, login_url='member_not_active')
+def calendar(request):
+    events = Event.objects.filter(is_public=True)
+    data = []
+
+    for event in events:
+        host = get_object_or_404(User, id=event.user_id)
+        data.append((event, host))
+
+    if request.method == 'POST':
+        user = request.user
+        start = request.POST.get('start')
+        end = request.POST.get('end')
+        date = request.POST.get('date')
+        start_ts, end_ts = coerce_times(start, end, date)
+        description = request.POST.get('description', '')
+        charge = request.POST.get('charge', 0)
+        is_public = True
+
+        event = Event(user=user, start_ts=start_ts, end_ts=end_ts, description=description, charge=charge, is_public=is_public)
+
+        event.save()
+
+        return HttpResponseRedirect(reverse('member_calendar'))
+
+    return render_to_response('members/calendar.html', {'data': data }, context_instance=RequestContext(request))
+
+# Copyright 2016 Office Nomads LLC (http://www.officenomads.com/) Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License. You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0 Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License.

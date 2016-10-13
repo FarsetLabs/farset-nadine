@@ -6,15 +6,17 @@ from datetime import timedelta
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 path = lambda *a: os.path.join(ROOT, *a)
+print("Loading global settings file...")
 
-TEMPLATE_DIRS = (path('../templates/'), )
+# TEMPLATE_DIRS = (path('../templates/'), )
+MEDIA_URL = '/media/'
 MEDIA_ROOT = path('../media/')
 
 BACKUP_ROOT = path('../backups/')
 BACKUP_COUNT = 30
 
 STATIC_URL = '/static/'
-STATICFILES_DIRS = ('static', )
+STATICFILES_DIRS = ('themes/active/static', 'static', )
 STATICFILES_FINDERS = (
     'django.contrib.staticfiles.finders.FileSystemFinder',
     'django.contrib.staticfiles.finders.AppDirectoriesFinder',
@@ -52,8 +54,8 @@ USE_I18N = True
 # Example: "http://media.lawrence.com"
 MEDIA_URL = '/media/'
 
-# Arp Watch data directory
-ARP_ROOT = path('../arp_import/')
+# Arp Watch data directory (This must be in the MEDIA_ROOT)
+ARP_ROOT = 'arp_import/'
 ARP_IMPORT_LOG = ARP_ROOT + 'import.log'
 ARP_IMPORT_LOCK = ARP_ROOT + 'importing.lock'
 ARP_IP_PFX = '172.16.5.'
@@ -73,18 +75,42 @@ AUTHENTICATION_BACKENDS = (
     'django.contrib.auth.backends.ModelBackend'
 )
 
-TEMPLATE_CONTEXT_PROCESSORS = (
-    "django.contrib.auth.context_processors.auth",
-    "django.core.context_processors.debug",
-    "django.core.context_processors.i18n",
-    "django.core.context_processors.media",
-    "django.core.context_processors.static",
-    "django.core.context_processors.request",
-    "django.contrib.messages.context_processors.messages",
-    "nadine.context_processors.site",
-    "nadine.context_processors.nav_context",
-    "nadine.context_processors.tablet_context",
-)
+TEMPLATES = [
+    {
+        'BACKEND': 'django.template.backends.django.DjangoTemplates',
+        'DIRS': [
+            'themes/active/templates',
+            'templates',
+        ],
+        'APP_DIRS': True,
+        'OPTIONS': {
+            'context_processors': [
+                'nadine.context_processors.site',
+                'nadine.context_processors.nav_context',
+                'nadine.context_processors.tablet_context',
+                'nadine.context_processors.allow_online_registration',
+                'django.contrib.auth.context_processors.auth',
+                'django.template.context_processors.debug',
+                'django.template.context_processors.i18n',
+                'django.template.context_processors.media',
+                'django.template.context_processors.static',
+                'django.template.context_processors.tz',
+                'django.template.context_processors.request',
+                'django.contrib.messages.context_processors.messages',
+            ],
+        },
+    },
+]
+
+# TEMPLATE_CONTEXT_PROCESSORS = (
+#     "django.contrib.auth.context_processors.auth",
+#     "django.core.context_processors.debug",
+#     "django.core.context_processors.i18n",
+#     "django.core.context_processors.media",
+#     "django.core.context_processors.static",
+#     "django.core.context_processors.request",
+#     "django.contrib.messages.context_processors.messages",
+# )
 
 MIDDLEWARE_CLASSES = (
     'django.middleware.common.CommonMiddleware',
@@ -113,10 +139,10 @@ INSTALLED_APPS = (
     'tablet',
     'easy_pdf',
     'jsignature',
-    'taggit_templatetags',
+    'taggit_templatetags2',
     'taggit',
     'djcelery',
-    #'gather',
+    'doors.keymaster',
     #'debug_toolbar',
 )
 
@@ -129,6 +155,14 @@ try:
 except ImportError:
     pass
 
+# Multimail settings
+# https://github.com/scott2b/django-multimail
+#MULTIMAIL_FROM_EMAIL_ADDRESS = ''
+#MULTIMAIL_EMAIL_VERIFICATION_URL = "https://apps.officenomads.com/mail/verify/%(emailaddress_id)s/%(verif_key)s"
+#MULTIMAIL_FROM_EMAIL_ADDRESS = 'nadine@officenomads.com"
+EMAIL_VERIFICATION_URL = ''
+EMAIL_POST_VERIFY_URL = "/members/profile/"
+
 # JSignature Settings
 JSIGNATURE_WIDTH = 500
 JSIGNATURE_HEIGHT = 200
@@ -140,11 +174,13 @@ JSIGNATURE_COLOR = "30F"
 JSIGNATURE_RESET_BUTTON = False
 
 # USAePay Settings
-USA_EPAY_URL = 'www.usaepay.com'
-USA_EPAY_KEY = 'ABCDEFG'
-USA_EPAY_KEY2 = 'ABCDEFG'
-USA_EPAY_PIN2 = '1234'
-USA_EPAY_URL_KEY = 'ABCDEFG'
+# Use API v1.4 Doc/Literal WSDL
+USA_EPAY_URL = "https://www.usaepay.com/soap/gate/YOUR_URL_CODE/usaepay.wsdl"
+USA_EPAY_KEY = "YOUR_USAEPAY_KEY"
+USA_EPAY_PIN = "YOUR_USAEPAY_PIN"
+# Used for adding billing profiles
+USA_EPAY_WEB_KEY = "YOUR_USAEPAY_KEY"
+
 
 CELERYBEAT_SCHEDULER = "djcelery.schedulers.DatabaseScheduler"
 CELERY_TASK_SERIALIZER = 'json'
@@ -163,6 +199,26 @@ CELERY_ALWAYS_EAGER = False
 # MAILCHIMP_API_KEY="YourMailchimpKey"
 # MAILCHIMP_NEWSLETTER_KEY="YourNewsletter"
 MAILCHIMP_WEBHOOK_KEY = "nadine"
+
+# Allows for the login page to include or not include the option for nonmembers to register and make a user account.
+ALLOW_ONLINE_REGISTRATION = False
+
+# Allows or does not allow for users to upload their own profile photo on the edit profile page.
+ALLOW_PHOTO_UPLOAD = False
+
+# The uncommented country below allows for either the US states or Canadian provinces to be options for member profiles.
+COUNTRY = 'US'
+# COUNTRY = 'CA'
+
+# Uncomment and insert social media URLS to be inserted in the footer
+#FACEBOOK_URL = "https://www.facebook.com/OfficeNomads"
+#TWITTER_URL = 'https://twitter.com/OfficeNomads'
+#YELP_URL = 'https://www.yelp.com/biz/office-nomads-seattle-2'
+#INSTAGRAM_URL = 'https://www.instagram.com/officenomads/'
+
+# These are business hours used to organize reservations. Times MUST be in military time. Calendar will be broken up via 15 minute increments
+# OPEN_TIME = '8:30'
+# CLOSE_TIME = '18:00'
 
 TEST_RUNNER = 'django.test.runner.DiscoverRunner'
 
@@ -215,7 +271,16 @@ LOGGING = {
     },
 }
 
-# Import the local settings file
-from local_settings import *
+# Import the local and theme SETTINGS files
+if os.path.isfile('nadine/local_settings.py'):
+    print("Loading local settings file...")
+    from nadine.local_settings import *
+if os.path.isfile('themes/active/theme_settings.py'):
+    print("Loading theme settings file...")
+    import imp
+    sys.path.append('themes/active')
+    theme_settings = imp.load_source('themes.active.theme_settings', 'themes/active/theme_settings.py')
+    from theme_settings import *
 
-# Copyright 2009 Office Nomads LLC (http://www.officenomads.com/) Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License. You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0 Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License.
+
+# Copyright 2016 Office Nomads LLC (http://www.officenomads.com/) Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License. You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0 Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License.

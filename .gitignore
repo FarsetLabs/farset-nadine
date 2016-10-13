@@ -4,7 +4,6 @@
 .DS_Store
 pip-log.txt
 backups
-nadine/settings.py
 nadine/local_settings.py
 media
 media/
@@ -21,3 +20,12 @@ celerybeat-schedule.db
 django.log
 databases
 xero_privatekey.pem
+newrelic.ini
+newrelic-celery.ini
+gw_config.json
+.vagrant/
+__pycache__/
+
+# Ignore Themes
+/themes/**
+!/themes/README.md

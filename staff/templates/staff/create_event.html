@@ -1,0 +1,15 @@
+{% extends "staff/staff_base.html" %}
+
+{% block sub-title %}Create Event | {% endblock %}
+
+
+{% block content %}
+  <h1>Create Event</h1>
+  <form name='event_form' action='./create' method='POST'>
+    {% csrf_token %}
+    <table id='event_form'>
+      {{ event_form.as_table}}
+    </table>
+    <input id='event-submit' type='submit' value='Create' />
+  </form>
+{% endblock %}

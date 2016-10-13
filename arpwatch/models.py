@@ -10,7 +10,7 @@ from django.db import connection
 from django.db.models import Min, Max
 from django.utils import timezone
 
-from nadine.models.core import Member, Membership
+from nadine.models.core import Membership
 
 
 class UserDevice(models.Model):
@@ -67,6 +67,24 @@ class ArpLog_Manager(models.Manager):
         for row in cursor.fetchall():
             device_logs.append(DeviceLog(row[0], row[1]))
         return device_logs
+
+    def for_user(self, username, day_start, day_end):
+        user = User.objects.get(username=username)
+        device_logs = OrderedDict()
+        DeviceLog = namedtuple('DeviceLog', 'start, end, diff')
+        logs = ArpLog.objects.filter(device__user=user, runtime__range=(day_start, day_end)).order_by('runtime')
+        for arp_log in logs:
+            local_time = timezone.localtime(arp_log.runtime)
+            key = local_time.date()
+            if key in device_logs:
+                start = device_logs[key].start
+                end = arp_log.runtime
+                device_logs[key] = DeviceLog(start, end, end - start)
+            else:
+                # Create a new device log
+                start = end = arp_log.runtime
+                device_logs[key] = DeviceLog(start, end, 0)
+        return device_logs.values()
 
 
 class ArpLog(models.Model):

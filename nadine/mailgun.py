@@ -1,3 +1,5 @@
+from __future__ import absolute_import
+
 import json
 import requests
 import datetime
@@ -13,7 +15,6 @@ from django.template.loader import get_template
 from django.contrib.sites.models import Site
 from django.utils import timezone
 
-from nadine.models.core import Member
 
 logger = logging.getLogger(__name__)
 
@@ -143,6 +144,10 @@ def clean_incoming(request):
 def send_manage_member(user, subject=None):
     if subject == None:
         subject = "Incomplete Tasks"
+    # Adjust the subject if we have a prefix
+    if hasattr(settings, "EMAIL_SUBJECT_PREFIX"):
+        subject = settings.EMAIL_SUBJECT_PREFIX.strip() + " " + subject.strip()
+
     subject = "%s - %s" % (subject, user.get_full_name())
     text_content, html_content = get_manage_member_content(user)
     mailgun_data = {"from": settings.EMAIL_ADDRESS,
@@ -199,7 +204,7 @@ def team(request):
         return HttpResponse(status=200)
 
     # Goes out to all managers
-    bcc_list = list(Member.objects.managers(include_future=True).values_list('user__email', flat=True))
+    bcc_list = list(User.helper.managers(include_future=True).values_list('email', flat=True))
     mailgun_data["bcc"] = bcc_list
 
     # Hard code the recipient to be this address

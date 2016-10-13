@@ -50,7 +50,8 @@ class Command(NoArgsCommand):
     def capitalize_name(self, name): return '%s%s' % (name[0].upper(), ''.join([c.lower() for c in name[1:]]))
 
     def handle_noargs(self, **options):
-        from nadine.models.core import Member, DailyLog, Membership
+        from nadine.models.core import Member, Membership
+        from nadine.models.usage import CoworkingDay
         from nadine.models.payment import Bill, Transaction
         from django.core.files import File
         pseudonymous_image = open('media/BlankIcon150x150.jpg', 'r')
@@ -60,7 +61,7 @@ class Command(NoArgsCommand):
                 log.note = 'Some admin note here.'
                 log.save()
 
-        for log in DailyLog.objects.all():
+        for log in CoworkingDay.objects.all():
             if log.note != None and len(log.note) > 0:
                 log.note = 'Some admin note here.'
                 log.save()
@@ -79,7 +80,6 @@ class Command(NoArgsCommand):
             member.user.username = '%s_%s' % (member.user.first_name, member.user.last_name)
             member.user.set_password('1234')  # User.objects.make_random_password()
             member.user.email = self.generate_email(member)
-            member.email2 = None
             member.phone = self.generate_phone_number()
             member.phone2 = ''
             member.url_personal = 'http://%s/' % DOMAINS[random.randint(0, len(DOMAINS) - 1)]

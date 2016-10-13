@@ -7,6 +7,7 @@ from django.core import management
 from django.contrib.auth.models import User
 from django.conf import settings
 from django.db import IntegrityError
+from django.utils import timezone
 
 import arp
 from arpwatch.models import *
@@ -14,14 +15,8 @@ from arpwatch.models import *
 
 class ArpWatchTest(TestCase):
 
-    def test_api(self):
-        response = self.client.get('/api/v1/activity/0/')
-        self.failUnlessEqual(response.status_code, 200, 'status was %s' % response.status_code)
-        result_data = json.loads(response.content)
-        self.failUnless('member_count' in result_data)
-
     def test_user_device(self):
-        MAC = "90:A2:DA:00:EE:5D"
+        MAC = "AA:AA:AA:AA:AA:AA"
         device1 = UserDevice.objects.create(mac_address=MAC)
         with self.assertRaises(IntegrityError):
             device2 = UserDevice.objects.create(mac_address=MAC)
@@ -55,3 +50,18 @@ class ArpWatchTest(TestCase):
 
         #self.assertEqual("90:A2:DA:00:EE:5D", mac1.value)
         #self.assertEqual("127.0.0.1", ip1.value)
+
+    def test_arpwatch_for_user(self):
+        user1 = User.objects.create(username='member_one', first_name='Member', last_name='One')
+        device1 = UserDevice.objects.create(user=user1, device_name="Device One", mac_address="90:A2:DA:00:EE:5D", ignore=False)
+        ip1 = "127.0.0.1"
+        now = timezone.now()
+        tz = timezone.get_current_timezone()
+        s = start = datetime(2015, 5, 3, 11, 0, 0, tzinfo=tz)
+        end = start + timedelta (hours=5)
+
+        while (s < end):
+            ArpLog.objects.create(runtime=s, device=device1, ip_address=ip1)
+            s = s + timedelta(minutes=5)
+
+        logs = ArpLog.objects.for_user(user1, start, end)

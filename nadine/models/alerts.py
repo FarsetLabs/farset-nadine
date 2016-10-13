@@ -12,7 +12,7 @@ from django.db.models.signals import post_save
 from django.conf import settings
 from django.utils import timezone
 
-from nadine.models.core import Member, Membership, FileUpload
+from nadine.models.core import UserProfile, Membership, FileUpload
 from nadine import mailgun
 
 logger = logging.getLogger(__name__)
@@ -25,7 +25,7 @@ class MemberAlertManager(models.Manager):
             MemberAlert.objects.create(user=user, key=key)
             return True
         return False
-        
+
     def create_if_new(self, user, key, new_since):
         old_alerts = MemberAlert.objects.filter(user=user, key=key, created_ts__gte=new_since)
         if old_alerts.count() == 0:
@@ -38,29 +38,29 @@ class MemberAlertManager(models.Manager):
         # Persistent alerts apply even if a member is inactive
         persistent = key in MemberAlert.PERSISTENT_ALERTS
         if active_only and not persistent:
-            active_users = Member.objects.active_users()
+            active_users = User.helper.active_members()
             return unresolved.filter(user__in=active_users)
         return unresolved
 
     def trigger_periodic_check(self):
         # Check for exiting members in the coming week
         exit_date = timezone.now() + timedelta(days=5)
-        exiting_members = Member.objects.exiting_members(exit_date)
-        for m in exiting_members:
+        exiting_members = User.helper.exiting_members(exit_date)
+        for u in exiting_members:
             # Only trigger exiting membership if no exit alerts were created in the last week
             start = timezone.now() - timedelta(days=5)
-            if MemberAlert.objects.filter(user=m.user, key__in=MemberAlert.PERSISTENT_ALERTS, created_ts__gte=start).count() == 0:
-                self.trigger_exiting_membership(m.user, exit_date)
+            if MemberAlert.objects.filter(user=u, key__in=MemberAlert.PERSISTENT_ALERTS, created_ts__gte=start).count() == 0:
+                self.trigger_exiting_membership(u, exit_date)
 
         # Check for stale membership
-        smd = Member.objects.stale_member_date()
-        for m in Member.objects.stale_members():
-            existing_alerts = MemberAlert.objects.filter(user=m.user, key=MemberAlert.STALE_MEMBER, created_ts__gte=smd)
+        smd = User.helper.stale_member_date()
+        for u in User.helper.stale_members():
+            existing_alerts = MemberAlert.objects.filter(user=u, key=MemberAlert.STALE_MEMBER, created_ts__gte=smd)
             if not existing_alerts:
-                MemberAlert.objects.create_if_not_open(user=m.user, key=MemberAlert.STALE_MEMBER)
+                MemberAlert.objects.create_if_not_open(user=u, key=MemberAlert.STALE_MEMBER)
 
         # Expire old and unresolved alerts
-        #active_users = Member.objects.active_users()
+        #active_users = UserProfile.objects.active_users()
         #exiting_users = exiting_members.values('user')
         # to_clean = [MemberAlert.PAPERWORK, MemberAlert.MEMBER_INFO, MemberAlert.MEMBER_AGREEMENT, MemberAlert.TAKE_PHOTO,
         #	MemberAlert.UPLOAD_PHOTO, MemberAlert.POST_PHOTO, MemberAlert.ORIENTATION, MemberAlert.KEY_AGREEMENT]
@@ -76,36 +76,37 @@ class MemberAlertManager(models.Manager):
 
         new_alerts = False
         open_alerts = user.profile.alerts_by_key(include_resolved=False)
-        
-        # Key?  Let's get it back!
+
         membership = user.profile.membership_for_day(day)
-        if membership:
-            if membership.has_key:
-                if MemberAlert.objects.create_if_new(user, MemberAlert.RETURN_DOOR_KEY, membership.start_date):
-                    new_alerts = True
-            if membership.has_desk:
-                if MemberAlert.ASSIGN_CABINET in open_alerts:
-                    # We never assigned a mailbox so we can just resolve that now
-                    user.profile.resolve_alerts(MemberAlert.ASSIGN_CABINET)
-                if not MemberAlert.objects.filter(user=user, key=MemberAlert.RETURN_DESK_KEY, created_ts__gte=membership.start_date):
-                    MemberAlert.objects.create(user=user, key=MemberAlert.RETURN_DESK_KEY)
-                    new_alerts = True
-            if membership.has_mail:
-                if MemberAlert.ASSIGN_MAILBOX in open_alerts:
-                    # We never assigned a mailbox so we can just resolve that now
-                    user.profile.resolve_alerts(MemberAlert.ASSIGN_MAILBOX)
-                elif not MemberAlert.objects.filter(user=user, key=MemberAlert.REMOVE_MAILBOX, created_ts__gte=membership.start_date):
-                    MemberAlert.objects.create(user=user, key=MemberAlert.REMOVE_MAILBOX)
-                    new_alerts = True
-        
-        # Take down their photo. 
+        if not membership:
+            membership = user.profile.last_membership()
+
+        if membership.has_key:
+            if MemberAlert.objects.create_if_new(user, MemberAlert.RETURN_DOOR_KEY, membership.start_date):
+                new_alerts = True
+        if membership.has_desk:
+            if MemberAlert.ASSIGN_CABINET in open_alerts:
+                # We never assigned a mailbox so we can just resolve that now
+                user.profile.resolve_alerts(MemberAlert.ASSIGN_CABINET)
+            if not MemberAlert.objects.filter(user=user, key=MemberAlert.RETURN_DESK_KEY, created_ts__gte=membership.start_date):
+                MemberAlert.objects.create(user=user, key=MemberAlert.RETURN_DESK_KEY)
+                new_alerts = True
+        if membership.has_mail:
+            if MemberAlert.ASSIGN_MAILBOX in open_alerts:
+                # We never assigned a mailbox so we can just resolve that now
+                user.profile.resolve_alerts(MemberAlert.ASSIGN_MAILBOX)
+            elif not MemberAlert.objects.filter(user=user, key=MemberAlert.REMOVE_MAILBOX, created_ts__gte=membership.start_date):
+                MemberAlert.objects.create(user=user, key=MemberAlert.REMOVE_MAILBOX)
+                new_alerts = True
+
+        # Take down their photo.
         if user.profile.photo:
             if MemberAlert.POST_PHOTO in open_alerts:
                 user.profile.resolve_alerts(MemberAlert.POST_PHOTO)
-            elif not MemberAlert.objects.filter(user=user, key=MemberAlert.REMOVE_PHOTO, created_ts__gte=membership.start_date):
+            elif not MemberAlert.REMOVE_PHOTO in open_alerts:
                 MemberAlert.objects.create(user=user, key=MemberAlert.REMOVE_PHOTO)
                 new_alerts = True
-        
+
         # Send an email to the team announcing their exit
         if new_alerts:
             end = membership.end_date
@@ -120,7 +121,7 @@ class MemberAlertManager(models.Manager):
         open_alerts = user.profile.alerts_by_key(include_resolved=False)
         all_alerts = user.profile.alerts_by_key(include_resolved=True)
         existing_files = user.profile.files_by_type()
-        existing_memberships = user.profile.memberships.all().order_by('start_date')
+        existing_memberships = user.membership_set.all().order_by('start_date')
         new_membership = existing_memberships.last()
 
         # Member Information
@@ -205,7 +206,7 @@ class MemberAlert(models.Model):
     MEMBER_INFO = "member_info"
     MEMBER_AGREEMENT = "member_agreement"
     TAKE_PHOTO = "take_photo"
-    UPLOAD_PHOTO = "upload_hoto"
+    UPLOAD_PHOTO = "upload_photo"
     POST_PHOTO = "post_photo"
     ORIENTATION = "orientation"
     KEY_AGREEMENT = "key_agreement"
@@ -301,14 +302,14 @@ class MemberAlert(models.Model):
 
 
 def membership_callback(sender, **kwargs):
-    print ("membership_callback")
+    #print("membership_callback")
     membership = kwargs['instance']
     created = kwargs['created']
     if created:
-        MemberAlert.objects.trigger_new_membership(membership.member.user)
+        MemberAlert.objects.trigger_new_membership(membership.user)
     else:
         # If this membership is older then a week we'll go straight to exiting member logic
         window_start = timezone.now() - timedelta(days=5)
         if membership.end_date and membership.end_date < window_start.date():
-            MemberAlert.objects.trigger_exiting_membership(membership.member.user)
+            MemberAlert.objects.trigger_exiting_membership(membership.user)
 post_save.connect(membership_callback, sender=Membership)

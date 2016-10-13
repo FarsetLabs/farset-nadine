@@ -1,13 +1,12 @@
 <div class="submenu">
-	<a href="{% url 'staff.views.stats' %}">daily logs</a> |
-	<a href="{% url 'staff.views.stats_neighborhood' %}">neighborhoods</a> |
-	<a href="{% url 'staff.views.stats_monthly' %}">monthly members</a> |
-	<a href="{% url 'staff.views.stats_membership_history' %}">membership history</a> |
-	<a href="{% url 'staff.views.stats_gender' %}">gender balance</a>
+	<a href="{% url 'staff_stats' %}">daily logs</a> |
+	<a href="{% url 'staff_stats_neighborhood' %}">neighborhoods</a> |
+	<a href="{% url 'staff_stats_monthly' %}">monthly members</a> |
+	<a href="{% url 'staff_stats_memberships' %}">membership history</a> |
+	<a href="{% url 'staff_stats_gender' %}">gender balance</a>
 </div>
 <div class="submenu">
-	<a href="{% url 'staff.views.stats_membership_days' %}">membership days</a> |
-	<a href="{% url 'staff.views.stats_history' %}">history graphs</a> |
-	<a href="{% url 'staff.views.stats_income' %}">income graph</a> |
-	<a href="{% url 'staff.views.stats_members' %}">members graph</a>
+	<a href="{% url 'staff_stats_memberdays' %}">membership days</a> |
+	<a href="{% url 'staff_stats_history' %}">member history</a> |
+	<a href="{% url 'staff_stats_graph' %}">graphs</a>
 </div>

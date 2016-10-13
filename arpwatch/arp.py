@@ -1,3 +1,4 @@
+import os
 import time
 import logging
 from datetime import datetime, time, date, timedelta
@@ -11,7 +12,6 @@ from django.db import transaction
 from django.utils import timezone
 
 from arpwatch.models import *
-from nadine.models.core import Member, DailyLog
 
 logger = logging.getLogger(__name__)
 
@@ -52,18 +52,27 @@ def map_ip_to_mac(hours):
                 a.device.save()
 
 
+def get_arp_root():
+    if not default_storage.exists(settings.ARP_ROOT):
+        os.mkdir(default_storage.path(settings.ARP_ROOT))
+    return settings.ARP_ROOT
+
+
 def list_files():
+    arp_root = get_arp_root()
     print("listing:")
-    print(settings.ARP_ROOT)
-    file_list = default_storage.listdir(settings.ARP_ROOT)[1]
+    print(arp_root)
+    file_list = default_storage.listdir(arp_root)[1]
     return file_list
 
 
 def import_dir_locked():
+    arp_root = get_arp_root()
     return default_storage.exists(settings.ARP_IMPORT_LOCK)
 
 
 def lock_import_dir():
+    arp_root = get_arp_root()
     msg = "locked: %s" % timezone.localtime(timezone.now())
     default_storage.save(settings.ARP_IMPORT_LOCK, ContentFile(msg))
 
@@ -73,6 +82,7 @@ def unlock_import_dir():
 
 
 def log_message(msg):
+    arp_root = get_arp_root()
     log = "%s: %s\r\n" % (timezone.localtime(timezone.now()), msg)
     if not default_storage.exists(settings.ARP_IMPORT_LOG):
         log = "%s: Log Started\r\n%s" % (timezone.localtime(timezone.now()), log)
@@ -133,7 +143,7 @@ def import_file(file, runtime):
 
 def import_snmp():
     runtime = timezone.now()
-    
+
     cmdGen = cmdgen.CommandGenerator()
     errorIndication, errorStatus, errorIndex, varBinds = cmdGen.nextCmd(
         cmdgen.CommunityData(settings.ARPWATCH_SNMP_COMMUNITY),
@@ -141,7 +151,7 @@ def import_snmp():
         cmdgen.MibVariable('IP-MIB', 'ipNetToMediaPhysAddress'),
         lookupNames=True, lookupValues=True
     )
-    
+
     for row in varBinds:
         for name, val in row:
             ip = name.prettyPrint().split('\"')[3]
@@ -180,25 +190,7 @@ def device_users_for_day(day=None):
     return query.values('device__user', 'runtime')
 
 
-def not_signed_in(day=None):
-    if not day:
-        day = timezone.localtime(timezone.now())
-    signed_in = []
-    for l in DailyLog.objects.filter(visit_date=day):
-        signed_in.append(l.member.user.id)
-
-    not_signed_in = []
-    for l in device_users_for_day(day):
-        user_id = l.get('device__user')
-        if user_id and user_id not in signed_in:
-            member = Member.objects.get(user__id=user_id)
-            if not member.has_desk():
-                not_signed_in.append(member)
-
-    return not_signed_in
-
-
-def users_for_day(day=None):
+def users_for_day_query(day=None):
     if not day:
         day = timezone.localtime(timezone.now())
     start = datetime(year=day.year, month=day.month, day=day.day, hour=0, minute=0, second=0, microsecond=0)
@@ -206,30 +198,4 @@ def users_for_day(day=None):
     end = start + timedelta(days=1)
     logger.info("users_for_day from '%s' to '%s'" % (start, end))
     arp_query = ArpLog.objects.filter(runtime__range=(start, end))
-    arp_members_query = Member.objects.filter(user__in=arp_query.values('device__user'))
-    daily_members_query = Member.objects.filter(pk__in=DailyLog.objects.filter(visit_date=day).values('member__id'))
-    combined_query = arp_members_query | daily_members_query
-    return combined_query.distinct()
-
-# def users_for_day(day=None):
-#	if not day:
-#		day=timezone.localtime(timezone.now())
-#	member_dict = {}
-#
-#	# Who's signed into the space today
-#	daily_logs = DailyLog.objects.filter(visit_date=day)
-#	for l in daily_logs:
-#		member_dict[l.member] = l.created
-#
-#	# Device Logs
-#	for l in device_users_for_day(day):
-#		runtime = l.get('runtime')
-#		user_id = l.get('device__user')
-#		if user_id:
-#			member = Member.objects.get(user__id=user_id)
-#			if not member_dict.has_key(member) or runtime < member_dict[member]:
-#				member_dict[member] = runtime
-#
-#	members = sorted(member_dict, key=member_dict.get)
-#	members.reverse()
-#	return members
+    return User.objects.filter(id__in=arp_query.values('device__user'))

@@ -16,21 +16,19 @@ from django.template.loader import render_to_string
 from django.utils.html import strip_tags
 from django.utils import timezone
 
-from nadine.models.core import Member, Membership
+from nadine.models.core import UserProfile, Membership
+from nadine.utils.slack_api import SlackAPI
 from interlink.message import MailingListMessage
+import interlink
 
 logger = logging.getLogger(__name__)
 
 
-def user_by_email(email):
-    users = User.objects.filter(email__iexact=email)
-    if len(users) > 0:
-        return users[0]
-    members = Member.objects.filter(email2__iexact=email)
-    if len(members) > 0:
-        return members[0].user
-    return None
-User.objects.find_by_email = user_by_email
+def unsubscribe_recent_dropouts():
+    """Remove mailing list subscriptions from members whose memberships expired yesterday and they do not start a membership today"""
+    recently_expired = User.objects.filter(membership__end_date=timezone.now().date() - timedelta(days=1)).exclude(membership__start_date=timezone.now().date())
+    for u in recently_expired:
+        MailingList.objects.unsubscribe_from_all(u)
 
 
 def membership_save_callback(sender, **kwargs):
@@ -39,12 +37,21 @@ def membership_save_callback(sender, **kwargs):
     created = kwargs['created']
     if not created:
         return
+
     # If the member is just switching from one membership to another, don't change subscriptions
-    if Membership.objects.filter(member=membership.member, end_date=membership.start_date - timedelta(days=1)).count() != 0:
-        return
+    # But if this membership is created in the past there is no way to know what they want so subscribe them
+    if membership.start_date > timezone.now().date():
+        if Membership.objects.filter(user=membership.user, end_date=membership.start_date - timedelta(days=1)).count() != 0:
+            return
+
     mailing_lists = MailingList.objects.filter(is_opt_out=True)
     for ml in mailing_lists:
-        ml.subscribers.add(membership.member.user)
+        ml.subscribers.add(membership.user)
+
+    # If this is their first membership, also invite them to Slack
+    if Membership.objects.filter(user=membership.user).count() == 1:
+        SlackAPI().invite_user_quiet(membership.user)
+
 post_save.connect(membership_save_callback, sender=Membership)
 
 
@@ -129,9 +136,6 @@ class MailingList(models.Model):
         return tuple([sub.email for sub in self.subscribers.all()])
 
     def __unicode__(self): return '%s' % self.name
-
-    @models.permalink
-    def get_absolute_url(self): return ('interlink.views.list', (), {'id': self.id})
 
     def create_incoming(self, message, commit=True):
         "Parses an email message and creates an IncomingMail from it."
@@ -278,7 +282,7 @@ class IncomingMail(models.Model):
         return outgoing
 
     def process(self):
-        self.owner = User.objects.find_by_email(self.origin_address)
+        self.owner = User.helper.by_email(self.origin_address)
 
         if self.mailing_list.moderator_controlled:
             if self.owner in self.mailing_list.moderators.all():
@@ -289,7 +293,7 @@ class IncomingMail(models.Model):
 
         elif self.owner == None or not self.sender_subscribed() or self.is_moderated_subject():
             subject = 'Moderation Request: %s: %s' % (self.mailing_list.name, self.subject)
-            body = render_to_string('interlink/email/moderation_required.txt', {'incoming_mail': self})
+            body = render_to_string('interlink/email/moderation_required.txt', context={'incoming_mail': self})
             OutgoingMail.objects.create(mailing_list=self.mailing_list, moderators_only=True, original_mail=self, subject=subject, body=body)
             self.state = 'moderate'
             self.save()
@@ -298,16 +302,16 @@ class IncomingMail(models.Model):
             self.create_outgoing()
 
     def get_user(self):
-        return user_by_email(self.origin_address)
+        return User.helper.by_email(self.origin_address)
 
     @property
-    def approve_url(self): return 'https://%s%s' % (Site.objects.get_current().domain, reverse('interlink.views.moderator_approve', kwargs={'id': self.id}, current_app='interlink'))
+    def approve_url(self): return 'https://%s%s' % (Site.objects.get_current().domain, reverse('interlink_approve', kwargs={'id': self.id}, current_app='interlink'))
 
     @property
-    def reject_url(self): return 'https://%s%s' % (Site.objects.get_current().domain, reverse('interlink.views.moderator_reject', kwargs={'id': self.id}))
+    def reject_url(self): return 'https://%s%s' % (Site.objects.get_current().domain, reverse('interlink_reject', kwargs={'id': self.id}))
 
     @property
-    def inspect_url(self): return 'https://%s%s' % (Site.objects.get_current().domain, reverse('interlink.views.moderator_inspect', kwargs={'id': self.id}))
+    def inspect_url(self): return 'https://%s%s' % (Site.objects.get_current().domain, reverse('interlink_inspect', kwargs={'id': self.id}))
 
     def __unicode__(self): return '%s: %s' % (self.origin_address, self.subject)
 
@@ -330,15 +334,18 @@ class OutgoingMailManager(models.Manager):
         # make a connection to the server, and send them all.
         for ml, mails in d.iteritems():
             try:
-                conn = ml.get_smtp_connection()
-                conn.open()
+                conn = None
+                try:
+                    conn = ml.get_smtp_connection()
+                    conn.open()
+                except Exception as e:
+                    logger.error("Could not open SMTP connection for '%s': %s" % (ml.name, str(e)), exc_info=sys.exc_info(), extra={'exception': e})
+                    break
                 for m in mails:
                     try:
                         m.send(conn)
-                    except MailingList.LimitExceeded, e:
-                        logger.warning("Limit exceeded: " + str(e),
-                                       exc_info=sys.exc_info(),
-                                       extra={'exception': e})
+                    except MailingList.LimitExceeded as e:
+                        logger.warning("Limit exceeded: " + str(e), exc_info=sys.exc_info(), extra={'exception': e})
                         break
 
             finally:

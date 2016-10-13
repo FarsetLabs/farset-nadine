@@ -1,15 +1,17 @@
 import time
 import logging
 import traceback
+from datetime import datetime, timedelta, date
 
 from django.conf import settings
 from django.db.models import Count, Q
 from django.core.exceptions import ObjectDoesNotExist
 from django.utils import timezone
-from datetime import datetime, timedelta, date
+from django.contrib.auth.models import User
 
-from nadine.models.core import Member, Membership, DailyLog
+from nadine.models.core import Membership
 from nadine.models.payment import Bill, BillingLog, Transaction
+from nadine.models.usage import CoworkingDay
 
 logger = logging.getLogger(__name__)
 
@@ -37,10 +39,8 @@ class Run:
 
     """The information which is gathered for a time period in order to calculate billing."""
 
-    def __init__(self, member, start_date, end_date, filter_closed_logs=True):
-        #logger.debug(("Run: member=%s, start=%s, end=%s") % (member, start_date, end_date))
-
-        self.member = member
+    def __init__(self, user, start_date, end_date, filter_closed_logs=True):
+        self.user = user
         self.start_date = start_date
         self.end_date = end_date
         self.days = []
@@ -79,7 +79,7 @@ class Run:
             self.days.append(Day(self.start_date + timedelta(days=i)))
 
     def populate_memberships(self):
-        for membership in Membership.objects.filter(member=self.member).order_by('start_date'):
+        for membership in Membership.objects.filter(user=self.user).order_by('start_date'):
             if membership.end_date and membership.end_date < self.start_date:
                 continue
             if membership.start_date > self.end_date:
@@ -88,37 +88,37 @@ class Run:
                 if self.days[i].date >= membership.start_date:
                     if membership.end_date == None or self.days[i].date <= membership.end_date:
                         if self.days[i].membership:
-                            print 'Duplicate membership! %s' % membership
+                            print('Duplicate membership! %s' % membership)
                         self.days[i].membership = membership
 
     def populate_daily_logs(self):
-        # Grab all the daily_logs from this member
-        daily_logs = DailyLog.objects.filter(member=self.member, payment="Bill", guest_of=None).filter(visit_date__gte=self.start_date).filter(visit_date__lte=self.end_date)
+        # Grab all the daily_logs from this user
+        daily_logs = CoworkingDay.objects.filter(user=self.user, payment="Bill", paid_by=None).filter(visit_date__gte=self.start_date).filter(visit_date__lte=self.end_date)
         if self.filter_closed_logs:
             daily_logs = daily_logs.annotate(bill_count=Count('bills')).filter(bill_count=0)
         for log in daily_logs.order_by('visit_date'):
             self.add_daily_log(log)
 
-        # Grab all the daily_logs marked as a guest of this member
-        daily_logs = DailyLog.objects.filter(guest_of=self.member, payment="Bill").filter(visit_date__gte=self.start_date).filter(visit_date__lte=self.end_date)
+        # Grab all the daily_logs marked as a guest of this user
+        daily_logs = CoworkingDay.objects.filter(paid_by=self.user, payment="Bill").filter(visit_date__gte=self.start_date).filter(visit_date__lte=self.end_date)
         if self.filter_closed_logs:
             daily_logs = daily_logs.annotate(bill_count=Count('bills')).filter(bill_count=0)
         for log in daily_logs.order_by('visit_date'):
             self.add_guest_log(log)
 
-        # Grab all the daily_logs attached to memberships marked as guests of this member
-        for membership in Membership.objects.filter(guest_of=self.member).order_by('start_date'):
+        # Grab all the daily_logs attached to memberships marked as guests of this user
+        for membership in Membership.objects.filter(paid_by=self.user).order_by('start_date'):
             if membership.end_date and membership.end_date < self.start_date:
                 continue
             if membership.start_date > self.end_date:
                 continue
-            for log in DailyLog.objects.filter(member=membership.member, payment="Bill", guest_of=None).filter(visit_date__gte=self.start_date).filter(visit_date__lte=self.end_date):
+            for log in CoworkingDay.objects.filter(user=membership.user, payment="Bill", paid_by=None).filter(visit_date__gte=self.start_date).filter(visit_date__lte=self.end_date):
                 self.add_guest_log(log)
 
     def add_daily_log(self, log):
         for i in range(0, len(self.days)):
             if log.visit_date == self.days[i].date:
-                if self.days[i].membership and self.days[i].membership.guest_of:
+                if self.days[i].membership and self.days[i].membership.paid_by:
                     # Skip guest activity.  It will get picked up by the host's bill.
                     break
                 self.days[i].daily_log = log
@@ -134,24 +134,24 @@ class Run:
         for day in self.days:
             if day.daily_log or day.is_membership_end_date() or day.is_membership_anniversary() or len(day.guest_daily_logs) > 0:
                 if day.daily_log:
-                    print '\tDaily log: %s' % day.daily_log.visit_date
+                    print('\tDaily log: %s' % day.daily_log.visit_date)
                 if day.is_membership_end_date():
-                    print '\t%s end: %s' % (day.membership.membership_plan, day.date)
+                    print('\t%s end: %s' % (day.membership.membership_plan, day.date))
                 if day.is_membership_anniversary():
-                    print '\t%s monthly anniversary: %s' % (day.membership.membership_plan, day.date)
+                    print('\t%s monthly anniversary: %s' % (day.membership.membership_plan, day.date))
                 if len(day.guest_daily_logs) > 0:
-                    print '\tGuest logs: %s' % day.guest_daily_logs
+                    print('\tGuest logs: %s' % day.guest_daily_logs)
 
     def __repr__(self):
         if len(self.days) == 0:
-            return 'Run for %s' % self.member
-        return 'Run for %s (%s / %s)' % (self.member, self.days[0].date, self.days[len(self.days) - 1].date)
+            return 'Run for %s' % self.user
+        return 'Run for %s (%s / %s)' % (self.user, self.days[0].date, self.days[len(self.days) - 1].date)
 
 
 def run_billing(bill_time=None):
     if not bill_time:
         bill_time = timezone.localtime(timezone.now())
-    """Generate billing records for every member who deserves it."""
+    """Generate billing records for every user who deserves it."""
     bill_date = datetime.date(bill_time)
     logger.info("run_billing: bill_time=%s, bill_date=%s" % (bill_time, bill_date))
     try:
@@ -166,24 +166,24 @@ def run_billing(bill_time=None):
     billing_success = False
     bill_count = 0
     try:
-            # This should be changed to "all members w/ activity or an active membership"
-        for member in Member.objects.all():
-            last_bill = member.last_bill()
+        # This should be changed to "all users w/ activity"
+        for user in User.objects.all():
+            last_bill = user.profile.last_bill()
             if last_bill:
                 start_date = last_bill.bill_date + timedelta(days=1)
             else:
                 start_date = bill_date - timedelta(days=62)
                 if start_date < settings.BILLING_START_DATE:
                     start_date = settings.BILLING_START_DATE
-            run = Run(member, start_date, bill_date)
+            run = Run(user, start_date, bill_date)
             for day_index in range(0, len(run.days)):  # look for days on which we should bill for a membership
                 day = run.days[day_index]
-                if day.is_membership_anniversary() or day.is_membership_end_date():  # calculate a member bill
+                if day.is_membership_anniversary() or day.is_membership_end_date():
                     bill_dropins = []
                     bill_guest_dropins = []
                     recent_days = run.days[0:day_index + 1]
                     recent_days.reverse()
-                    for recent_day in recent_days:  # gather the daily logs for this member and guests under this membership
+                    for recent_day in recent_days:  # gather the daily logs for this user and guests under this membership
                         if recent_day.bill:
                             break
                         if recent_day.daily_log:
@@ -197,7 +197,7 @@ def run_billing(bill_time=None):
                         monthly_fee = 0
                     billable_dropin_count = max(0, len(bill_dropins) + len(bill_guest_dropins) - day.membership.dropin_allowance)
                     bill_amount = monthly_fee + (billable_dropin_count * day.membership.daily_rate)
-                    day.bill = Bill(bill_date=day.date, amount=bill_amount, member=member, paid_by=day.membership.guest_of, membership=day.membership)
+                    day.bill = Bill(bill_date=day.date, amount=bill_amount, user=user, paid_by=day.membership.paid_by, membership=day.membership)
                     #logger.debug('saving bill: %s - %s - %s' % (day.bill, day, billable_dropin_count))
                     day.bill.save()
                     bill_count += 1
@@ -207,20 +207,20 @@ def run_billing(bill_time=None):
 
                     # Close out the transaction if no money is due
                     if bill_amount == 0:
-                        transaction = Transaction(member=member, amount=0, status='closed')
+                        transaction = Transaction(user=user, amount=0, status='closed')
                         transaction.save()
                         transaction.bills = [day.bill]
                         transaction.save()
 
-            # Now calculate a bill for non-member drop-ins if they exist and it has been two weeks since we billed them
+            # Now calculate a bill for non-member drop-ins if they exist.
             bill_dropins, guest_bill_dropins = run.non_member_daily_logs()
             if len(bill_dropins) > 0 or len(guest_bill_dropins) > 0:
-                time_to_bill_guests = len(guest_bill_dropins) > 0 and (bill_date - guest_bill_dropins[0].visit_date) >= timedelta(weeks=2)
-                time_to_bill_dropins = len(bill_dropins) > 0 and (bill_date - bill_dropins[0].visit_date) >= timedelta(weeks=2)
+                time_to_bill_guests = len(guest_bill_dropins) > 0 and (bill_date - guest_bill_dropins[0].visit_date) >= timedelta(days=1)
+                time_to_bill_dropins = len(bill_dropins) > 0 and (bill_date - bill_dropins[0].visit_date) >= timedelta(days=1)
                 if time_to_bill_guests or time_to_bill_dropins:
                     bill_amount = (len(bill_dropins) + len(guest_bill_dropins)) * settings.NON_MEMBER_DROPIN_FEE
                     last_day = run.days[len(run.days) - 1]
-                    last_day.bill = Bill(bill_date=last_day.date, amount=bill_amount, member=member)
+                    last_day.bill = Bill(bill_date=last_day.date, amount=bill_amount, user=user)
                     last_day.bill.save()
                     bill_count += 1
                     last_day.bill.dropins = [dropin.id for dropin in bill_dropins]
@@ -239,4 +239,4 @@ def run_billing(bill_time=None):
         if not billing_success:
             logger.error(billing_log.note)
 
-# Copyright 2010 Office Nomads LLC (http://www.officenomads.com/) Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License. You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0 Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License.
+# Copyright 2016 Office Nomads LLC (http://www.officenomads.com/) Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License. You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0 Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License.
