@@ -12,7 +12,7 @@ mailchimp==2.0.9
 MonthDelta==1.0b0
 pytz==2016.6.1
 requests==2.11.1
-cryptography==1.5.2
+cryptography==3.3.2
 suds-jurko==0.6
 gunicorn
 
